@@ -4,13 +4,12 @@
 const AREA = { w: 139.45, e: 140.05, s: 35.45, n: 35.90 }; // ヒートマップの範囲
 const CELL_M = 100;            // マスの大きさ（m）。data/landmask.png と同じ
 const WALK_M_PER_MIN = 80;
-const WALK_DETOUR = 1.3;       // 道の回り道ぶん
+const WALK_DETOUR = 1.2;       // 道の回り道ぶん（マスをたどった距離に掛ける）
 const BIKE_M_PER_MIN = 250;    // 時速15km
-const BIKE_DETOUR = 1.25;
+const BIKE_DETOUR = 1.15;
 const WAIT_MIN = 3;            // 最初の電車の待ち時間
-const ACCESS_MAX_M = 1500;     // 駅まで歩く最大距離（直線）
 const EGRESS_MAX_MIN = 20;     // 通勤先の近くで電車を降りる駅（徒歩の上限）
-const MAX_MIN = 90;
+const BRIDGE_CELLS = 2;        // この幅（×2マス＝約400m）までの川・運河は橋で渡れるとみなす
 
 const BINS = [ // [上限の分, 色]
   // 45分までは5分刻み（近いほど濃い青→緑→黄）
@@ -33,6 +32,30 @@ function meters(lon1, lat1, lon2, lat2) {
 const walkMin = (m) => m * WALK_DETOUR / WALK_M_PER_MIN;
 const bikeMin = (m) => m * BIKE_DETOUR / BIKE_M_PER_MIN;
 
+// ===== マス目 =====
+// 行はメルカトル座標で等間隔にとる（地図の画像レイヤーとずれないように）
+const mercY = (lat) => Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360));
+const latOf = (y) => (2 * Math.atan(Math.exp(y)) - Math.PI / 2) * 180 / Math.PI;
+const COLS = Math.round((AREA.e - AREA.w) * M_PER_DEG_LAT * COS0 / CELL_M);
+const ROWS = Math.round((AREA.n - AREA.s) * M_PER_DEG_LAT / CELL_M);
+const NCELL = COLS * ROWS;
+const Y_N = mercY(AREA.n), Y_S = mercY(AREA.s);
+const CELL_W = (AREA.e - AREA.w) * M_PER_DEG_LAT * COS0 / COLS;
+const CELL_H = (AREA.n - AREA.s) * M_PER_DEG_LAT / ROWS;
+const STEPS = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]]
+  .map(([dc, dr]) => [dc, dr, Math.hypot(dc * CELL_W, dr * CELL_H)]);
+
+function cellOf(lon, lat) {
+  const c = Math.floor((lon - AREA.w) / (AREA.e - AREA.w) * COLS);
+  const r = Math.floor((Y_N - mercY(lat)) / (Y_N - Y_S) * ROWS);
+  if (c < 0 || r < 0 || c >= COLS || r >= ROWS) return -1;
+  return r * COLS + c;
+}
+function cellCenter(i) {
+  const c = i % COLS, r = (i - c) / COLS;
+  return [AREA.w + (c + 0.5) / COLS * (AREA.e - AREA.w), latOf(Y_N - (r + 0.5) / ROWS * (Y_N - Y_S))];
+}
+
 // ===== 状態 =====
 const state = {
   graph: null,
@@ -41,6 +64,8 @@ const state = {
   toDest: null,        // 駅ごとの通勤先までの時間（分）
   next: null,          // 経路で次に進む駅（-1 = ここで降りて歩く）
   nextKind: null,      // 0=乗車 1=乗換
+  destField: null,     // マスごとの通勤先までの歩く距離（m）{dist, prev}
+  trainField: null,    // マスごとの電車＋徒歩の時間（分）{dist, prev, via}
   point: null,         // 選んだ地点
   opacity: 1,
   showStations: true,
@@ -49,6 +74,7 @@ const state = {
 // ===== 駅データ =====
 let adj = [];          // [[to, 分, 種類], ...]
 let bucket = new Map(); // 近くの駅を探すための格子
+let nodeCell = null;   // 駅ごとのマス番号
 const BUCKET_DEG = 0.02;
 const bkey = (x, y) => x * 10000 + y;
 
@@ -64,6 +90,7 @@ async function loadGraph() {
     if (!bucket.has(k)) bucket.set(k, []);
     bucket.get(k).push(i);
   });
+  nodeCell = Int32Array.from(g.nodes, ([, lon, lat]) => cellOf(lon, lat));
   state.graph = g;
 }
 
@@ -85,19 +112,152 @@ function nearbyStations(lon, lat, maxM) {
   return out;
 }
 
-// ===== 最短時間（通勤先から逆向きに計算） =====
-function solve() {
-  const g = state.graph, N = g.nodes.length, { lon, lat } = state.dest;
+// ===== 陸地 =====
+let land = null;     // 陸=1、海・川=0（色を塗るかどうか）
+let walkable = null; // 歩ける=1（陸＋橋で渡れる幅の川・運河＋駅）
+
+let walkMask = null; // 陸＋橋（scripts/build_walkmask.py で作成）
+
+// 白黒のマスク画像をマスごとの 0/1 にする。読めなければ null
+async function loadMask(path) {
+  try {
+    const img = new Image();
+    img.src = path;
+    await img.decode();
+    const c = document.createElement('canvas');
+    c.width = COLS; c.height = ROWS;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(img, 0, 0, COLS, ROWS);
+    const px = ctx.getImageData(0, 0, COLS, ROWS).data;
+    const out = new Uint8Array(NCELL);
+    for (let i = 0; i < NCELL; i++) out[i] = px[i * 4] > 127 ? 1 : 0;
+    return out;
+  } catch { return null; }
+}
+async function loadLandMask() {
+  [land, walkMask] = await Promise.all([loadMask('data/landmask.png'), loadMask('data/walkmask.png')]);
+}
+
+// 正方形の窓で広げる（dilate）/ 削る（erode）。端の外は陸として扱う
+function morph(src, R, dilate) {
+  const tmp = new Uint8Array(NCELL), out = new Uint8Array(NCELL);
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    let v = dilate ? 0 : 1;
+    for (let k = -R; k <= R; k++) {
+      const cc = c + k;
+      if (cc < 0 || cc >= COLS) continue;
+      const x = src[r * COLS + cc];
+      if (dilate ? x : !x) { v = dilate ? 1 : 0; break; }
+    }
+    tmp[r * COLS + c] = v;
+  }
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    let v = dilate ? 0 : 1;
+    for (let k = -R; k <= R; k++) {
+      const rr = r + k;
+      if (rr < 0 || rr >= ROWS) continue;
+      const x = tmp[rr * COLS + c];
+      if (dilate ? x : !x) { v = dilate ? 1 : 0; break; }
+    }
+    out[r * COLS + c] = v;
+  }
+  return out;
+}
+
+function buildWalkable() {
+  if (walkMask) walkable = Uint8Array.from(walkMask); // 陸＋実際の橋
+  // 橋データがないときは、狭い川・運河を埋めて渡れるとみなす（おおまか）
+  else walkable = land ? morph(morph(land, BRIDGE_CELLS, true), BRIDGE_CELLS, false) : new Uint8Array(NCELL).fill(1);
+  for (const i of nodeCell) if (i >= 0) walkable[i] = 1;
+}
+
+// 水の上のマスを選んだときは、近くの歩けるマスに寄せる
+function snapCell(i) {
+  if (i < 0 || walkable[i]) return i;
+  const c0 = i % COLS, r0 = (i - c0) / COLS;
+  for (let R = 1; R <= 3; R++) for (let dr = -R; dr <= R; dr++) for (let dc = -R; dc <= R; dc++) {
+    const c = c0 + dc, r = r0 + dr;
+    if (c >= 0 && r >= 0 && c < COLS && r < ROWS && walkable[r * COLS + c]) return r * COLS + c;
+  }
+  return -1;
+}
+
+// ===== 最短経路 =====
+class Heap { // 値の小さい順に取り出す
+  constructor() { this.k = new Float64Array(1 << 16); this.v = new Int32Array(1 << 16); this.n = 0; this.key = 0; }
+  push(key, val) {
+    if (this.n === this.k.length) {
+      const k = new Float64Array(this.n * 2), v = new Int32Array(this.n * 2);
+      k.set(this.k); v.set(this.v); this.k = k; this.v = v;
+    }
+    const K = this.k, V = this.v;
+    let i = this.n++;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (K[p] <= key) break;
+      K[i] = K[p]; V[i] = V[p]; i = p;
+    }
+    K[i] = key; V[i] = val;
+  }
+  pop() {
+    const K = this.k, V = this.v;
+    const top = V[0]; this.key = K[0];
+    const n = --this.n, key = K[n], val = V[n];
+    let i = 0;
+    for (;;) {
+      let m = i * 2 + 1;
+      if (m >= n) break;
+      if (m + 1 < n && K[m + 1] < K[m]) m++;
+      if (K[m] >= key) break;
+      K[i] = K[m]; V[i] = V[m]; i = m;
+    }
+    K[i] = key; V[i] = val;
+    return top;
+  }
+}
+
+// 歩けるマスだけを通る最短経路。seeds: [[マス, 初期値, 由来]]、perM: 1mあたりの増え方
+function gridDijkstra(seeds, perM) {
+  const dist = new Float64Array(NCELL).fill(Infinity);
+  const prev = new Int32Array(NCELL).fill(-1);
+  const via = new Int32Array(NCELL).fill(-1);
+  const h = new Heap();
+  for (const [i, t, s] of seeds) {
+    if (i >= 0 && t < dist[i]) { dist[i] = t; via[i] = s; h.push(t, i); }
+  }
+  while (h.n) {
+    const u = h.pop(), t = h.key;
+    if (t > dist[u]) continue;
+    const uc = u % COLS, ur = (u - uc) / COLS;
+    for (const [dc, dr, len] of STEPS) {
+      const c = uc + dc, r = ur + dr;
+      if (c < 0 || r < 0 || c >= COLS || r >= ROWS) continue;
+      const v = r * COLS + c;
+      if (!walkable[v]) continue;
+      // 斜めに進むときは、角の両側が水なら通れない（細い川を斜めにすり抜けない）
+      if (dc && dr && !walkable[ur * COLS + c] && !walkable[r * COLS + uc]) continue;
+      const nt = t + len * perM;
+      if (nt < dist[v]) { dist[v] = nt; prev[v] = u; via[v] = via[u]; h.push(nt, v); }
+    }
+  }
+  return { dist, prev, via };
+}
+
+// 電車：通勤先から逆向きに、駅ごとの「通勤先までの時間」を出す
+function solveRail() {
+  const g = state.graph, N = g.nodes.length, dm = state.destField.dist;
   const dist = new Float64Array(N).fill(Infinity);
   const next = new Int32Array(N).fill(-1);
   const kind = new Int8Array(N);
-  const heap = new MinHeap();
-  for (const [i, d] of nearbyStations(lon, lat, EGRESS_MAX_MIN * WALK_M_PER_MIN / WALK_DETOUR)) {
-    const t = walkMin(d);
-    if (t < dist[i]) { dist[i] = t; heap.push(t, i); }
+  const heap = new Heap();
+  for (let i = 0; i < N; i++) {
+    if (nodeCell[i] < 0) continue;
+    const t = walkMin(dm[nodeCell[i]]);
+    if (t <= EGRESS_MAX_MIN) { dist[i] = t; heap.push(t, i); }
   }
-  while (heap.size) {
-    const [t, u] = heap.pop();
+  while (heap.n) {
+    const u = heap.pop(), t = heap.key;
     if (t > dist[u]) continue;
     for (const [v, w, k] of adj[u]) {
       const nt = t + w;
@@ -109,88 +269,52 @@ function solve() {
   state.nextKind = kind;
 }
 
-class MinHeap {
-  constructor() { this.a = []; }
-  get size() { return this.a.length; }
-  push(p, v) {
-    const a = this.a; a.push([p, v]);
-    let i = a.length - 1;
-    while (i > 0) { const j = (i - 1) >> 1; if (a[j][0] <= a[i][0]) break; [a[i], a[j]] = [a[j], a[i]]; i = j; }
-  }
-  pop() {
-    const a = this.a, top = a[0], last = a.pop();
-    if (a.length) {
-      a[0] = last; let i = 0;
-      for (;;) {
-        const l = i * 2 + 1, r = l + 1; let m = i;
-        if (l < a.length && a[l][0] < a[m][0]) m = l;
-        if (r < a.length && a[r][0] < a[m][0]) m = r;
-        if (m === i) break;
-        [a[i], a[m]] = [a[m], a[i]]; i = m;
-      }
-    }
-    return top;
-  }
+function computeFields() {
+  const destCell = snapCell(cellOf(state.dest.lon, state.dest.lat));
+  state.destField = gridDijkstra([[destCell, 0, -1]], 1);
+  solveRail();
+  // 電車＋徒歩：通勤先（そのまま歩く）と各駅（待ち＋乗車）から同時に歩いて広げる
+  const seeds = [[destCell, 0, -1]];
+  state.toDest.forEach((t, s) => { if (t < Infinity && nodeCell[s] >= 0) seeds.push([nodeCell[s], WAIT_MIN + t, s]); });
+  state.trainField = gridDijkstra(seeds, WALK_DETOUR / WALK_M_PER_MIN);
 }
 
-// ある地点から通勤先までの時間。{min, via: 駅番号 or -1, access: 駅まで歩く分}
+// ある地点から通勤先までの時間。{min, via: 駅番号 or -1, access: 駅まで歩く分, cell}
 function timeFrom(lon, lat) {
-  const d = meters(lon, lat, state.dest.lon, state.dest.lat);
-  if (state.mode === 'bike') return { min: bikeMin(d), via: -1 };
-  let best = { min: walkMin(d), via: -1 };
-  if (state.mode === 'walk') return best;
-  for (const [i, dm] of nearbyStations(lon, lat, ACCESS_MAX_M)) {
-    const acc = walkMin(dm);
-    const t = acc + WAIT_MIN + state.toDest[i];
-    if (t < best.min) best = { min: t, via: i, access: acc };
-  }
-  return best;
+  const i = snapCell(cellOf(lon, lat));
+  if (i < 0) return { min: Infinity, via: -1, cell: -1 };
+  return timeAt(i);
+}
+function timeAt(i) {
+  const m = state.destField.dist[i];
+  if (state.mode === 'walk') return { min: walkMin(m), via: -1, cell: i, m };
+  if (state.mode === 'bike') return { min: bikeMin(m), via: -1, cell: i, m };
+  const f = state.trainField, via = f.via[i];
+  return { min: f.dist[i], via, cell: i, m, access: via >= 0 ? f.dist[i] - WAIT_MIN - state.toDest[via] : 0 };
+}
+
+// prev をたどって、マスの並び（経路）を座標にする
+function tracePath(prev, i) {
+  const out = [];
+  for (let n = 0; i >= 0 && n < 5000; n++) { out.push(cellCenter(i)); i = prev[i]; }
+  return out;
 }
 
 // ===== ヒートマップ画像 =====
-// 行はメルカトル座標で等間隔にとる（地図の画像レイヤーとずれないように）
-const mercY = (lat) => Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360));
-const latOf = (y) => (2 * Math.atan(Math.exp(y)) - Math.PI / 2) * 180 / Math.PI;
-const COLS = Math.round((AREA.e - AREA.w) * M_PER_DEG_LAT * COS0 / CELL_M);
-const ROWS = Math.round((AREA.n - AREA.s) * M_PER_DEG_LAT / CELL_M);
 const canvas = document.createElement('canvas');
 canvas.width = COLS; canvas.height = ROWS;
-let land = null; // 陸=1、海・川=0（マスごと）
-
-// 陸地マスク（scripts/build_landmask.py で作成）を読み込む。読めなければ全部陸として扱う
-async function loadLandMask() {
-  try {
-    const img = new Image();
-    img.src = 'data/landmask.png';
-    await img.decode();
-    const c = document.createElement('canvas');
-    c.width = COLS; c.height = ROWS;
-    const ctx = c.getContext('2d', { willReadFrequently: true });
-    ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(img, 0, 0, COLS, ROWS);
-    const px = ctx.getImageData(0, 0, COLS, ROWS).data;
-    land = new Uint8Array(COLS * ROWS);
-    for (let i = 0; i < land.length; i++) land[i] = px[i * 4] > 127 ? 1 : 0;
-  } catch { land = null; }
-}
-
 const RGB = BINS.map(([, c]) => c && [1, 3, 5].map((k) => parseInt(c.slice(k, k + 2), 16)));
 
 function drawHeatmap() {
   const ctx = canvas.getContext('2d');
   const img = ctx.createImageData(COLS, ROWS);
-  const yN = mercY(AREA.n), yS = mercY(AREA.s);
-  for (let r = 0; r < ROWS; r++) {
-    const lat = latOf(yN - (r + 0.5) / ROWS * (yN - yS));
-    for (let c = 0; c < COLS; c++) {
-      const lon = AREA.w + (c + 0.5) / COLS * (AREA.e - AREA.w);
-      if (land && !land[r * COLS + c]) continue; // 海・川の上は塗らない
-      const t = timeFrom(lon, lat).min;
-      const bi = BINS.findIndex(([max]) => t < max);
-      const rgb = RGB[bi];
-      const p = (r * COLS + c) * 4;
-      if (rgb) { img.data[p] = rgb[0]; img.data[p + 1] = rgb[1]; img.data[p + 2] = rgb[2]; img.data[p + 3] = 255; }
-    }
+  for (let i = 0; i < NCELL; i++) {
+    if (land && !land[i]) continue; // 海・川の上は塗らない
+    const t = timeAt(i).min;
+    const rgb = RGB[BINS.findIndex(([max]) => t < max)];
+    if (!rgb) continue;
+    const p = i * 4;
+    img.data[p] = rgb[0]; img.data[p + 1] = rgb[1]; img.data[p + 2] = rgb[2]; img.data[p + 3] = 255;
   }
   ctx.putImageData(img, 0, 0);
   const src = map.getSource('heat');
@@ -254,17 +378,18 @@ function addLayers() {
   map.addLayer({ id: 'route-walk', type: 'line', source: 'route', filter: ['==', ['get', 'kind'], 'walk'], layout: { 'line-cap': 'round' }, paint: { 'line-color': '#13233f', 'line-width': 3, 'line-dasharray': [1, 2] } });
 }
 
+
 // ===== 通勤先・地点 =====
 function setDest(lon, lat, name) {
   state.dest = { lon, lat, name: name || nearestName(lon, lat) };
   destMarker.setLngLat([lon, lat]).addTo(map);
   document.getElementById('dest-name').textContent = state.dest.name;
   document.getElementById('dest-coord').textContent = `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
-  recompute();
+  computeFields();
+  redraw();
 }
 
-function recompute() {
-  if (state.mode === 'train') solve();
+function redraw() {
   drawHeatmap();
   if (state.point) showPoint(state.point.lon, state.point.lat);
   saveHash();
@@ -281,32 +406,37 @@ function showPoint(lon, lat) {
   state.point = { lon, lat };
   const g = state.graph;
   const res = timeFrom(lon, lat);
+  const ok = res.min < Infinity;
   pointMarker.setLngLat([lon, lat]).addTo(map);
   timeMarker.setLngLat([lon, lat]).addTo(map);
-  timeMarker.getElement().textContent = `${fmt(res.min)}分`;
+  timeMarker.getElement().textContent = ok ? `${fmt(res.min)}分` : '—';
 
   document.getElementById('hint').hidden = true;
   document.getElementById('point').hidden = false;
   document.getElementById('point-name').textContent = nearestName(lon, lat);
-  document.getElementById('point-min').textContent = fmt(res.min);
+  document.getElementById('point-min').textContent = ok ? fmt(res.min) : '—';
   const dKm = meters(lon, lat, state.dest.lon, state.dest.lat) / 1000;
-  document.getElementById('point-sub').textContent = `${MODE_LABEL[state.mode]}・直線 ${dKm.toFixed(1)}km`;
+  document.getElementById('point-sub').textContent = ok
+    ? `${MODE_LABEL[state.mode]}・直線 ${dKm.toFixed(1)}km`
+    : '海の上か、陸から行けない場所です';
 
   const steps = [];
   const features = [];
-  const walkLine = (a, b) => features.push({ type: 'Feature', properties: { kind: 'walk' }, geometry: { type: 'LineString', coordinates: [a, b] } });
+  const walkLine = (coords) => features.push({ type: 'Feature', properties: { kind: 'walk' }, geometry: { type: 'LineString', coordinates: coords } });
   const destPt = [state.dest.lon, state.dest.lat];
 
-  if (res.via < 0) {
-    const label = state.mode === 'bike' ? '自転車' : '徒歩';
-    steps.push({ c: '#13233f', what: `${label}で通勤先へ`, t: res.min, sub: `約${(dKm * (state.mode === 'bike' ? BIKE_DETOUR : WALK_DETOUR)).toFixed(1)}km` });
-    walkLine([lon, lat], destPt);
+  if (!ok) {
+    // 何も描かない
+  } else if (res.via < 0) {
+    const bike = state.mode === 'bike';
+    steps.push({ c: '#13233f', what: `${bike ? '自転車' : '徒歩'}で通勤先へ`, t: res.min, sub: `約${(res.m * (bike ? BIKE_DETOUR : WALK_DETOUR) / 1000).toFixed(1)}km` });
+    walkLine([[lon, lat], ...tracePath(state.destField.prev, res.cell), destPt]);
   } else {
-    // 駅までの徒歩
+    // 駅までの徒歩（水辺を回り込む道のり）
     let i = res.via;
     const n0 = g.nodes[i];
     steps.push({ c: '#13233f', what: `${n0[0]}駅まで徒歩`, t: res.access });
-    walkLine([lon, lat], [n0[1], n0[2]]);
+    walkLine([[lon, lat], ...tracePath(state.trainField.prev, res.cell), [n0[1], n0[2]]]);
     steps.push({ c: '#999', what: '電車を待つ', t: WAIT_MIN, sub: '目安' });
     // 乗車区間を路線ごとにまとめる
     let seg = null;
@@ -331,7 +461,7 @@ function showPoint(lon, lat) {
     const last = g.nodes[i];
     if (seg) steps.push(seg.step(last[0]));
     steps.push({ c: '#13233f', what: `${last[0]}駅から徒歩`, t: state.toDest[i] });
-    walkLine([last[1], last[2]], destPt);
+    walkLine([[last[1], last[2]], ...tracePath(state.destField.prev, nodeCell[i]), destPt]);
   }
   map.getSource('route').setData({ type: 'FeatureCollection', features });
 
@@ -431,7 +561,7 @@ document.getElementById('modes').addEventListener('click', (e) => {
   const b = e.target.closest('button[data-mode]');
   if (!b || b.dataset.mode === state.mode) return;
   setMode(b.dataset.mode);
-  recompute();
+  redraw();
 });
 function setMode(m) {
   state.mode = m;
@@ -492,6 +622,7 @@ map.on('touchend', () => clearTimeout(pressTimer));
 // ===== 起動 =====
 map.on('load', async () => {
   await Promise.all([loadGraph(), loadLandMask()]);
+  buildWalkable();
   buildStationIndex();
   buildLegend();
   addLayers();
