@@ -390,6 +390,7 @@ function setDest(lon, lat, name) {
 }
 
 function redraw() {
+  if (!state.destField) return; // まだ読み込み中
   drawHeatmap();
   if (state.point) showPoint(state.point.lon, state.point.lat);
   saveHash();
