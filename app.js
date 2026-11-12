@@ -351,7 +351,7 @@ map.touchZoomRotate.disableRotation();
 map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-left');
 
 const destMarker = new maplibregl.Marker({ element: Object.assign(document.createElement('div'), { className: 'dest-pin' }), anchor: 'bottom' });
-const timeMarker = new maplibregl.Marker({ element: Object.assign(document.createElement('div'), { className: 'time-tag' }), anchor: 'bottom', offset: [0, -14] });
+const timeMarker = new maplibregl.Marker({ element: Object.assign(document.createElement('div'), { className: 'time-tag' }), anchor: 'bottom', offset: [0, -36] }); // 地点のピン（高さ約33px）に重ねない
 const pointMarker = new maplibregl.Marker({ color: '#13233f', scale: 0.8 });
 
 function addLayers() {
@@ -373,9 +373,19 @@ function addLayers() {
     },
   });
   map.addSource('route', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
-  map.addLayer({ id: 'route-casing', type: 'line', source: 'route', filter: ['==', ['get', 'kind'], 'ride'], layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#fff', 'line-width': 9 } });
-  map.addLayer({ id: 'route-ride', type: 'line', source: 'route', filter: ['==', ['get', 'kind'], 'ride'], layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': ['get', 'color'], 'line-width': 5 } });
-  map.addLayer({ id: 'route-walk', type: 'line', source: 'route', filter: ['==', ['get', 'kind'], 'walk'], layout: { 'line-cap': 'round' }, paint: { 'line-color': '#13233f', 'line-width': 3, 'line-dasharray': [1, 2] } });
+  // スマホの小さい画面でもヒートマップの色に埋もれないよう、濃い縁＋白い縁で二重に縁取る
+  const W = (z11, z15) => ['interpolate', ['linear'], ['zoom'], 11, z11, 15, z15];
+  const ride = ['==', ['get', 'kind'], 'ride'];
+  const walk = ['==', ['get', 'kind'], 'walk'];
+  const round = { 'line-join': 'round', 'line-cap': 'round' };
+  for (const [kind, f, halo, casing] of [['walk', walk, W(9, 12), W(6, 8)], ['ride', ride, W(13, 18), W(10, 14)]]) {
+    map.addLayer({ id: `route-halo-${kind}`, type: 'line', source: 'route', filter: f, layout: round, paint: { 'line-color': '#13233f', 'line-opacity': 0.55, 'line-width': halo } });
+    map.addLayer({ id: `route-casing-${kind}`, type: 'line', source: 'route', filter: f, layout: round, paint: { 'line-color': '#fff', 'line-width': casing } });
+  }
+  map.addLayer({ id: 'route-ride', type: 'line', source: 'route', filter: ride, layout: round, paint: { 'line-color': ['get', 'color'], 'line-width': W(6, 9) } });
+  map.addLayer({ id: 'route-walk', type: 'line', source: 'route', filter: walk, layout: { 'line-cap': 'round' }, paint: { 'line-color': '#13233f', 'line-width': W(3, 4), 'line-dasharray': [1, 1.6] } });
+  // 乗車駅・乗換駅・降車駅
+  map.addLayer({ id: 'route-stops', type: 'circle', source: 'route', filter: ['==', ['get', 'kind'], 'stop'], paint: { 'circle-radius': W(5, 7), 'circle-color': '#fff', 'circle-stroke-color': '#13233f', 'circle-stroke-width': W(2.5, 3) } });
 }
 
 
@@ -466,6 +476,10 @@ function showPoint(lon, lat) {
     }
     const last = g.nodes[i];
     if (seg) steps.push(seg.step(last[0]));
+    for (const f of features.filter((f) => f.properties.kind === 'ride')) {
+      const c = f.geometry.coordinates;
+      for (const pt of [c[0], c[c.length - 1]]) features.push({ type: 'Feature', properties: { kind: 'stop' }, geometry: { type: 'Point', coordinates: pt } });
+    }
     steps.push({ c: '#13233f', what: `${last[0]}駅から徒歩`, t: state.toDest[i] });
     walkLine([[last[1], last[2]], ...tracePath(state.destField.prev, nodeCell[i]), destPt]);
   }

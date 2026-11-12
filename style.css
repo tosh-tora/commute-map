@@ -108,8 +108,10 @@ button { font: inherit; cursor: pointer; }
   .body { flex-direction: column; }
   #map { flex: none; height: 58vh; }
   .panel { width: auto; border-left: 0; border-top: 1px solid var(--line); padding: 16px; }
-  .legend { left: 8px; bottom: auto; top: calc(58vh - 96px); right: 8px; width: auto; max-width: 320px; padding: 8px 10px; }
-  .legend .note { display: none; }
+  /* 経路を隠さないよう、地図下端に細く置く（タイトル・注記は省く） */
+  .legend { left: 8px; bottom: auto; top: calc(58vh - 76px); right: 8px; width: auto; max-width: 280px; padding: 5px 8px; border-radius: 8px; }
+  .legend-title, .legend .note { display: none; }
+  .bins div { height: 8px; }
   .big { font-size: 44px; }
   .seg button { padding: 6px 12px; }
 }
