@@ -45,7 +45,7 @@ const inBox = (c) => c[0] >= BBOX.w && c[0] <= BBOX.e && c[1] >= BBOX.s && c[1] 
 const lines = [];           // [名前, 色]
 const nodes = [];           // [駅名, 経度, 緯度, 路線番号]
 const nodeIdx = new Map();  // 駅ID -> 番号
-const edges = [];           // [a, b, 分×10, 種類 0=乗車 1=乗換]
+const edges = [];           // [a, b, 分×10, 種類 0=乗車 1=乗換 2=直通]
 
 for (const r of railways) {
   const v = speedOf(r.id);
@@ -58,7 +58,7 @@ for (const r of railways) {
     if (!s || !inBox(s.coord)) { prev = null; continue; }
     if (!nodeIdx.has(sid)) {
       nodeIdx.set(sid, nodes.length);
-      nodes.push([s.title.ja, +s.coord[0].toFixed(5), +s.coord[1].toFixed(5), li]);
+      nodes.push([s.title.ja.normalize('NFKC'), +s.coord[0].toFixed(5), +s.coord[1].toFixed(5), li]);
     }
     const cur = nodeIdx.get(sid);
     if (prev !== null && prev !== cur) {
@@ -82,6 +82,74 @@ for (const g of groups) {
   for (let a = 0; a < all.length; a++) for (let b = a + 1; b < all.length; b++)
     for (const x of all[a]) for (const y of all[b]) edges.push([x, y, TRANSFER_NEAR * 10, 1]);
 }
+
+// 直通運転：つながる路線どうしの乗換を「乗換なし」（0分、種類2）にする
+const THROUGH = [
+  ['TokyoMetro.Hanzomon', 'Tokyu.DenEnToshi', '渋谷'],
+  ['TokyoMetro.Hanzomon', 'Tobu.TobuSkytreeBranch', '押上'],
+  ['Tobu.TobuSkytreeBranch', 'Tobu.TobuSkytree', '曳舟'],
+  ['TokyoMetro.Hibiya', 'Tobu.TobuSkytree', '北千住'],
+  ['TokyoMetro.Fukutoshin', 'Tokyu.Toyoko', '渋谷'],
+  ['TokyoMetro.Fukutoshin', 'Tobu.Tojo', '和光市'],
+  ['TokyoMetro.Fukutoshin', 'Seibu.SeibuYurakucho', '小竹向原'],
+  ['TokyoMetro.Yurakucho', 'Tobu.Tojo', '和光市'],
+  ['TokyoMetro.Yurakucho', 'Seibu.SeibuYurakucho', '小竹向原'],
+  ['Seibu.SeibuYurakucho', 'Seibu.Ikebukuro', '練馬'],
+  ['TokyoMetro.Namboku', 'Tokyu.Meguro', '目黒'],
+  ['TokyoMetro.Namboku', 'SaitamaRailway.SaitamaRailway', '赤羽岩淵'],
+  ['Toei.Mita', 'Tokyu.Meguro', '目黒'],
+  ['TokyoMetro.Chiyoda', 'JR-East.JobanLocal', '綾瀬'],
+  ['TokyoMetro.Chiyoda', 'Odakyu.Odawara', '代々木上原'],
+  ['TokyoMetro.Tozai', 'JR-East.ChuoSobuLocal', '中野・西船橋'],
+  ['TokyoMetro.Tozai', 'ToyoRapid.ToyoRapid', '西船橋'],
+  ['Toei.Asakusa', 'Keisei.Oshiage', '押上'],
+  ['Toei.Asakusa', 'Keikyu.Main', '泉岳寺'],
+  ['Keisei.Oshiage', 'Keisei.Main', '青砥'],
+  ['Keisei.Main', 'Hokuso.Hokuso', '京成高砂'],
+  ['Keikyu.Main', 'Keikyu.Airport', '京急蒲田'],
+  ['Toei.Shinjuku', 'Keio.KeioNew', '新宿'],
+  ['Keio.KeioNew', 'Keio.Keio', '笹塚'],
+  ['Tokyu.Toyoko', 'Minatomirai.Minatomirai', '横浜'],
+  ['Tokyu.Toyoko', 'Tokyu.TokyuShinYokohama', '日吉'],
+  ['Tokyu.Meguro', 'Tokyu.TokyuShinYokohama', '日吉'],
+  ['Tokyu.TokyuShinYokohama', 'Sotetsu.SotetsuShinYokohama', '新横浜'],
+  ['Sotetsu.SotetsuShinYokohama', 'Sotetsu.Main', '西谷'],
+  ['JR-East.SotetsuDirect', 'Sotetsu.SotetsuShinYokohama', '羽沢横浜国大'],
+  ['JR-East.SaikyoKawagoe', 'TWR.Rinkai', '大崎'],
+  ['JR-East.Tokaido', 'JR-East.Utsunomiya', '東京'],            // 上野東京ライン
+  ['JR-East.Tokaido', 'JR-East.Takasaki', '東京'],              // 上野東京ライン
+  ['JR-East.Tokaido', 'JR-East.JobanRapid', '東京・品川'],            // 上野東京ライン
+  ['JR-East.Yokosuka', 'JR-East.SobuRapid', '東京'],
+];
+const nodeRail = [];
+for (const r of railways) for (const sid of r.stations) if (nodeIdx.has(sid)) nodeRail[nodeIdx.get(sid)] = r.id;
+const pairKey = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
+// 組 -> つながる駅の名前（この駅での乗換だけを直通にする）
+const through = new Map(THROUGH.map(([a, b, at]) => [pairKey(a, b), at.split('・')]));
+const isJunction = (k, i) => through.get(k).some((name) => nodes[i][0].startsWith(name));
+const found = new Map();
+for (const e of edges) {
+  if (e[3] !== 1) continue;
+  const k = pairKey(nodeRail[e[0]], nodeRail[e[1]]);
+  if (!through.has(k) || !isJunction(k, e[0]) || !isJunction(k, e[1])) continue;
+  e[2] = 0; e[3] = 2;
+  found.set(k, [...(found.get(k) || []), nodes[e[0]][0]]);
+}
+// 乗換データに入っていない組は、つながる駅（同じ名前・500m以内）どうしを直接つなぐ
+for (const k of through.keys()) {
+  if (found.has(k)) continue;
+  const [a, b] = k.split('|');
+  for (let i = 0; i < nodes.length; i++) {
+    if (nodeRail[i] !== a || !isJunction(k, i)) continue;
+    for (let j = 0; j < nodes.length; j++) {
+      if (nodeRail[j] !== b || nodes[i][0] !== nodes[j][0]) continue;
+      if (km(nodes[i].slice(1, 3), nodes[j].slice(1, 3)) > 0.5) continue;
+      edges.push([i, j, 0, 2]);
+      found.set(k, [...(found.get(k) || []), nodes[i][0]]);
+    }
+  }
+}
+for (const k of through.keys()) console.log(`直通 ${k}: ${found.has(k) ? [...new Set(found.get(k))].join('・') : '見つからない'}`);
 
 await mkdir(join(ROOT, 'data'), { recursive: true });
 const out = { source: 'Mini Tokyo 3D (MIT License)', lines, nodes, edges };

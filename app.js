@@ -440,19 +440,24 @@ function showPoint(lon, lat) {
     walkLine([[lon, lat], ...tracePath(state.trainField.prev, res.cell), [n0[1], n0[2]]]);
     steps.push({ c: '#999', what: '電車を待つ', t: WAIT_MIN, sub: '目安' });
     // 乗車区間を路線ごとにまとめる
-    let seg = null;
+    let seg = null, through = false;
     while (state.next[i] >= 0) {
       const j = state.next[i];
       const w = state.toDest[i] - state.toDest[j];
       const ni = g.nodes[i], nj = g.nodes[j];
-      if (state.nextKind[i] === 1) {
+      if (state.nextKind[i] === 2) {
+        // 直通運転：乗り換えずにそのまま次の路線へ
+        through = !!seg; // 乗る前（乗った駅での付け替え）は直通と書かない
+        if (seg) { steps.push(seg.step(ni[0])); seg = null; }
+      } else if (state.nextKind[i] === 1) {
         if (seg) { steps.push(seg.step(ni[0])); seg = null; }
         steps.push({ c: '#999', what: `${ni[0]}で乗換`, t: w, sub: nj[0] !== ni[0] ? `${nj[0]}へ` : '' });
       } else {
         const [ln, color] = g.lines[ni[3]];
         if (!seg) {
-          seg = { from: ni[0], line: ln, color, t: 0, n: 0, coords: [[ni[1], ni[2]]],
-            step(to) { return { c: this.color, line: this.line, what: `${this.from} → ${to}`, t: this.t, sub: `${this.n}駅` }; } };
+          seg = { from: ni[0], line: ln, color, t: 0, n: 0, coords: [[ni[1], ni[2]]], through,
+            step(to) { return { c: this.color, line: this.line, what: `${this.from} → ${to}`, t: this.t, sub: `${this.n}駅${this.through ? '・直通（乗換なし）' : ''}` }; } };
+          through = false;
           features.push({ type: 'Feature', properties: { kind: 'ride', color }, geometry: { type: 'LineString', coordinates: seg.coords } });
         }
         seg.t += w; seg.n += 1; seg.coords.push([nj[1], nj[2]]);
