@@ -483,6 +483,7 @@ function showPoint(lon, lat) {
     steps.push({ c: '#13233f', what: `${last[0]}駅から徒歩`, t: state.toDest[i] });
     walkLine([[last[1], last[2]], ...tracePath(state.destField.prev, nodeCell[i]), destPt]);
   }
+  state.routeFeatures = features;
   map.getSource('route').setData({ type: 'FeatureCollection', features });
 
   const ol = document.getElementById('steps');
@@ -627,7 +628,23 @@ function readHash() {
 }
 
 // ===== クリック・右クリック・長押し =====
-map.on('click', (e) => showPoint(e.lngLat.lng, e.lngLat.lat));
+map.on('click', (e) => {
+  showPoint(e.lngLat.lng, e.lngLat.lat);
+  fitRoute();
+});
+
+// タップした地点から通勤先までの経路全体が見えるようにズームする（redraw からは呼ばない：モード切替などで勝手に動かさない）
+function fitRoute() {
+  const b = new maplibregl.LngLatBounds();
+  b.extend([state.point.lon, state.point.lat]).extend([state.dest.lon, state.dest.lat]);
+  for (const f of state.routeFeatures) {
+    const g = f.geometry;
+    for (const c of g.type === 'Point' ? [g.coordinates] : g.coordinates) b.extend(c);
+  }
+  // 上：所要時間ラベル、左：ズームボタン、下：凡例を避ける（凡例の高さは画面幅で変わるので実測する）
+  const bottom = map.getContainer().getBoundingClientRect().bottom - document.querySelector('.legend').getBoundingClientRect().top + 20;
+  map.fitBounds(b, { padding: { top: 70, left: 56, right: 30, bottom: Math.max(40, bottom) }, maxZoom: 15, duration: 600 });
+}
 map.on('contextmenu', (e) => setDest(e.lngLat.lng, e.lngLat.lat));
 let pressTimer = 0, pressStart = null;
 map.on('touchstart', (e) => {

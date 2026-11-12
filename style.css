@@ -102,16 +102,27 @@ button { font: inherit; cursor: pointer; }
 .dest-pin { width: 26px; height: 26px; border-radius: 50% 50% 50% 0; transform: rotate(-45deg); background: var(--dest); border: 3px solid #fff; box-shadow: 0 2px 6px rgba(0,0,0,.35); }
 
 @media (max-width: 760px) {
-  .top { grid-template-columns: 1fr; padding: 10px 16px; }
-  .title h1 { font-size: 18px; }
+  /* スマホでは地図下の狭い枠の中ではなく、ページ全体をスクロールさせて経路の説明を全部読めるようにする */
+  :root { --map-h: 52vh; --map-h: 52svh; }
+  html, body { height: auto; }
+  body { display: block; }
+  .top { grid-template-columns: 1fr; gap: 6px; padding: 8px 12px; }
+  .title h1 { font-size: 17px; }
   .lead { display: none; }
-  .body { flex-direction: column; }
-  #map { flex: none; height: 58vh; }
-  .panel { width: auto; border-left: 0; border-top: 1px solid var(--line); padding: 16px; }
+  .search input { padding: 8px 14px; font-size: 16px; } /* 16px 未満だと iOS が入力時に拡大する */
+  .toolbar { gap: 6px; flex-wrap: nowrap; }
+  .seg button { padding: 5px 10px; font-size: 13px; }
+  .sep { display: none; }
+  .chip { padding: 5px 10px; font-size: 13px; white-space: nowrap; }
+  .body { display: block; }
+  #map { height: var(--map-h); }
+  .panel { width: auto; overflow: visible; border-left: 0; border-top: 1px solid var(--line); padding: 16px; gap: 18px; }
+  /* タップした地点の時間と経路を、通勤先の表示より先に見せる */
+  #point, #hint { order: -1; }
   /* 経路を隠さないよう、地図下端に細く置く（タイトル・注記は省く） */
-  .legend { left: 8px; bottom: auto; top: calc(58vh - 76px); right: 8px; width: auto; max-width: 280px; padding: 5px 8px; border-radius: 8px; }
+  .legend { left: 8px; bottom: auto; top: calc(var(--map-h) - 76px); right: 8px; width: auto; max-width: 280px; padding: 5px 8px; border-radius: 8px; }
   .legend-title, .legend .note { display: none; }
   .bins div { height: 8px; }
   .big { font-size: 44px; }
-  .seg button { padding: 6px 12px; }
 }
+
