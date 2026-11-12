@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>通勤時間マップ</title>
+  <meta name="description" content="東京23区と周辺で、通勤先までの所要時間を地図に色で表示します。">
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="title">
+      <h1>通勤時間マップ</h1>
+      <p class="lead">東京23区と周辺。通勤先を選ぶと、そこまでの所要時間を色で表示します。地図をクリックするとその地点からの時間と経路を表示。右クリック（スマホは長押し）で通勤先を変更。</p>
+    </div>
+    <div class="search">
+      <input id="q" type="search" placeholder="通勤先を検索（駅名・住所）" autocomplete="off">
+      <ul id="suggest" class="suggest" hidden></ul>
+    </div>
+    <div class="toolbar">
+      <div class="seg" id="modes" role="group" aria-label="通勤手段">
+        <button data-mode="train" class="on">電車＋徒歩</button>
+        <button data-mode="bike">自転車</button>
+        <button data-mode="walk">徒歩</button>
+      </div>
+      <span class="sep"></span>
+      <button id="opacity" class="chip">濃さ：中</button>
+      <button id="stations" class="chip on">駅</button>
+    </div>
+  </header>
+
+  <main class="body">
+    <div id="map"></div>
+
+    <div class="legend">
+      <div class="legend-title">通勤先までの時間</div>
+      <div id="legend-bins" class="bins"></div>
+      <div class="note">※電車の時間は駅間の距離からの目安です（実際の時刻表ではありません）</div>
+    </div>
+
+    <aside class="panel">
+      <section>
+        <div class="label">通勤先</div>
+        <div class="dest-name" id="dest-name">—</div>
+        <div class="muted" id="dest-coord"></div>
+      </section>
+
+      <section id="point" hidden>
+        <div class="label">選んだ地点</div>
+        <div class="point-name" id="point-name"></div>
+        <div class="big"><span id="point-min">—</span><small>分</small></div>
+        <div class="muted" id="point-sub"></div>
+        <ol class="steps" id="steps"></ol>
+      </section>
+
+      <section id="hint" class="hint">
+        地図をクリックすると、その地点から通勤先までの時間と経路を表示します。
+      </section>
+
+      <footer class="credit">
+        地図：<a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank" rel="noopener">地理院タイル</a>
+        ／ 駅・路線：<a href="https://github.com/nagix/mini-tokyo-3d" target="_blank" rel="noopener">Mini Tokyo 3D</a>（MIT）
+        ／ 住所検索：国土地理院
+      </footer>
+    </aside>
+  </main>
+
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
