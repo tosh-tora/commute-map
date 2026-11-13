@@ -332,6 +332,163 @@ function drawHeatmap() {
   }
 }
 
+// ===== Google マップ用に書き出す（KML） =====
+// Google マイマップは画像の重ね合わせ（GroundOverlay）を読めないので、
+// 時間帯ごとの範囲を多角形にして書き出す。1時間帯＝1つの Placemark（中は MultiGeometry）
+const KML_MIN_CELLS = 3;      // これより小さい島・穴は捨てる（マス数）
+const KML_TOLERANCE = 0.5;    // 頂点を間引くときの許容誤差（マス。約50m）
+const KML_FILL_ALPHA = '99';  // 塗りの不透明度（16進。99 ≒ 60%）
+
+// 0/1 の格子から輪郭（マスの角を結んだ閉じた線）を取り出す。
+// 範囲が進む向きの右側に来るように辺をつなぐので、外周は画面上で時計回り、穴は反時計回りになる
+function traceRings(inside) {
+  const W = COLS + 1;
+  const out = new Map(); // 始点（角の番号） -> [終点, ...]
+  const add = (x0, y0, x1, y1) => {
+    const a = y0 * W + x0;
+    if (!out.has(a)) out.set(a, []);
+    out.get(a).push(y1 * W + x1);
+  };
+  const at = (c, r) => c >= 0 && r >= 0 && c < COLS && r < ROWS && inside[r * COLS + c];
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    if (!inside[r * COLS + c]) continue;
+    if (!at(c, r - 1)) add(c, r, c + 1, r);         // 上
+    if (!at(c + 1, r)) add(c + 1, r, c + 1, r + 1); // 右
+    if (!at(c, r + 1)) add(c + 1, r + 1, c, r + 1); // 下
+    if (!at(c - 1, r)) add(c, r + 1, c, r);         // 左
+  }
+  const rings = [];
+  for (const [start] of out) {
+    while (out.get(start)?.length) {
+      const ring = [start];
+      let prev = start, cur = out.get(start).pop();
+      while (cur !== start) {
+        ring.push(cur);
+        const cand = out.get(cur);
+        let k = 0;
+        if (cand.length > 1) {
+          // 角で2本に分かれるときは右に曲がる方を選ぶ（斜めに接するマスを別々の範囲に保つ）
+          const dx = cur % W - prev % W, dy = Math.floor(cur / W) - Math.floor(prev / W);
+          k = Math.max(0, cand.findIndex((n) => n % W - cur % W === -dy && Math.floor(n / W) - Math.floor(cur / W) === dx));
+        }
+        prev = cur;
+        cur = cand.splice(k, 1)[0];
+      }
+      rings.push(ring.map((v) => [v % W, Math.floor(v / W)]));
+    }
+  }
+  return rings;
+}
+
+const ringArea = (p) => { let s = 0; for (let i = 0, j = p.length - 1; i < p.length; j = i++) s += (p[j][0] - p[i][0]) * (p[j][1] + p[i][1]); return s / 2; };
+
+// Douglas–Peucker 法で頂点を減らす（閉じた線）
+function simplifyRing(p, tol) {
+  const dp = (pts) => {
+    if (pts.length < 3) return pts;
+    const [a, b] = [pts[0], pts[pts.length - 1]];
+    const L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+    let best = -1, bi = 0;
+    for (let i = 1; i < pts.length - 1; i++) {
+      const d = Math.abs((b[0] - a[0]) * (a[1] - pts[i][1]) - (a[0] - pts[i][0]) * (b[1] - a[1])) / L;
+      if (d > best) { best = d; bi = i; }
+    }
+    if (best <= tol) return [a, b];
+    return [...dp(pts.slice(0, bi + 1)).slice(0, -1), ...dp(pts.slice(bi))];
+  };
+  // 始点から一番遠い点で2つに分けて、それぞれ間引く
+  let far = 0, fd = -1;
+  p.forEach((q, i) => { const d = (q[0] - p[0][0]) ** 2 + (q[1] - p[0][1]) ** 2; if (d > fd) { fd = d; far = i; } });
+  const s = [...dp(p.slice(0, far + 1)).slice(0, -1), ...dp([...p.slice(far), p[0]]).slice(0, -1)];
+  return s.length >= 3 ? s : null;
+}
+
+function insideRing(pt, ring) {
+  let ins = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i], [xj, yj] = ring[j];
+    if ((yi > pt[1]) !== (yj > pt[1]) && pt[0] < (xj - xi) * (pt[1] - yi) / (yj - yi) + xi) ins = !ins;
+  }
+  return ins;
+}
+
+// 1つの時間帯の範囲 -> [{outer, holes: []}, ...]（マスの角の座標）
+function bandPolygons(inside) {
+  const outers = [], holes = [];
+  for (const raw of traceRings(inside)) {
+    const a = ringArea(raw);
+    if (Math.abs(a) < KML_MIN_CELLS) continue;
+    const ring = simplifyRing(raw, KML_TOLERANCE);
+    if (!ring) continue;
+    if (a > 0) outers.push({ outer: ring, holes: [], area: a, box: bbox(ring) });
+    else holes.push(ring);
+  }
+  outers.sort((x, y) => x.area - y.area); // 穴は、それを含む一番小さい外周に入れる
+  for (const h of holes) {
+    const pt = h[0];
+    const o = outers.find((o) => pt[0] >= o.box[0] && pt[0] <= o.box[2] && pt[1] >= o.box[1] && pt[1] <= o.box[3] && insideRing(pt, o.outer));
+    if (o) o.holes.push(h);
+  }
+  return outers;
+}
+function bbox(ring) {
+  let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
+  for (const [x, y] of ring) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+  return [x0, y0, x1, y1];
+}
+
+// マスの角の座標 -> "経度,緯度"。KML の外周は反時計回りが正なので向きを逆にする
+const cornerLonLat = ([x, y]) => [AREA.w + x / COLS * (AREA.e - AREA.w), latOf(Y_N - y / ROWS * (Y_N - Y_S))];
+const kmlCoords = (ring) => [...ring, ring[0]].reverse().map((q) => cornerLonLat(q).map((v) => v.toFixed(5)).join(',')).join(' ');
+const xmlEscape = (s) => String(s).replace(/[<>&'"]/g, (ch) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' }[ch]));
+
+function buildKml() {
+  const colored = BINS.filter(([, c]) => c);
+  const band = new Int8Array(NCELL).fill(-1);
+  for (let i = 0; i < NCELL; i++) {
+    if (land && !land[i]) continue;
+    const k = BINS.findIndex(([max]) => timeAt(i).min < max);
+    if (k < colored.length) band[i] = k;
+  }
+  const title = `通勤時間：${state.dest.name}（${MODE_LABEL[state.mode]}）`;
+  const parts = [];
+  const stats = { placemarks: 0, polygons: 0, vertices: 0 };
+  colored.forEach(([max, color], k) => {
+    const label = `${k ? colored[k - 1][0] : 0}〜${max}分`;
+    const inside = Uint8Array.from(band, (b) => (b === k ? 1 : 0));
+    const polys = bandPolygons(inside);
+    if (!polys.length) return;
+    const kmlColor = KML_FILL_ALPHA + color.slice(5, 7) + color.slice(3, 5) + color.slice(1, 3); // aabbggrr
+    parts.push(`<Style id="b${k}"><LineStyle><color>00ffffff</color><width>0</width></LineStyle><PolyStyle><color>${kmlColor}</color><outline>0</outline></PolyStyle></Style>`);
+    const geoms = polys.map((p) => {
+      stats.polygons++;
+      stats.vertices += p.outer.length + p.holes.reduce((s, h) => s + h.length, 0);
+      const inner = p.holes.map((h) => `<innerBoundaryIs><LinearRing><coordinates>${kmlCoords(h)}</coordinates></LinearRing></innerBoundaryIs>`).join('');
+      return `<Polygon><outerBoundaryIs><LinearRing><coordinates>${kmlCoords(p.outer)}</coordinates></LinearRing></outerBoundaryIs>${inner}</Polygon>`;
+    }).join('');
+    parts.push(`<Placemark><name>${xmlEscape(label)}</name><styleUrl>#b${k}</styleUrl><MultiGeometry>${geoms}</MultiGeometry></Placemark>`);
+    stats.placemarks++;
+  });
+  parts.push(`<Placemark><name>${xmlEscape(state.dest.name)}</name><description>通勤先</description><Point><coordinates>${state.dest.lon.toFixed(6)},${state.dest.lat.toFixed(6)}</coordinates></Point></Placemark>`);
+  stats.placemarks++;
+  const desc = `通勤時間マップ（https://tosh-tora.github.io/commute-map/）で作成。${MODE_LABEL[state.mode]}で通勤先までにかかる時間の目安です。`;
+  const kml = `<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>${xmlEscape(title)}</name><description>${xmlEscape(desc)}</description>${parts.join('')}</Document></kml>\n`;
+  return { kml, title, stats };
+}
+
+function downloadKml() {
+  const { kml, title } = buildKml();
+  const name = `${title.replace(/^通勤時間：/, '通勤時間_').replace(/[（）]/g, '_').replace(/[\\/:*?"<>|\s]/g, '').replace(/_+$/, '')}.kml`;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([kml], { type: 'application/vnd.google-earth.kml+xml' }));
+  a.download = name;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  document.getElementById('kml-help').hidden = false;
+}
+
 // ===== 地図 =====
 const map = new maplibregl.Map({
   container: 'map',
@@ -604,6 +761,7 @@ document.getElementById('opacity').addEventListener('click', (e) => {
   e.currentTarget.textContent = `濃さ：${OPACITY[state.opacity][0]}`;
   map.setPaintProperty('heat', 'raster-opacity', OPACITY[state.opacity][1]);
 });
+document.getElementById('export-kml').addEventListener('click', () => { if (state.destField) downloadKml(); });
 document.getElementById('stations').addEventListener('click', (e) => {
   state.showStations = !state.showStations;
   e.currentTarget.classList.toggle('on', state.showStations);
