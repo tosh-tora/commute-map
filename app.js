@@ -3,10 +3,16 @@
 // ===== 設定 =====
 const AREA = { w: 139.45, e: 140.05, s: 35.45, n: 35.90 }; // ヒートマップの範囲
 const CELL_M = 100;            // マスの大きさ（m）。data/landmask.png と同じ
-const WALK_M_PER_MIN = 80;
-const WALK_DETOUR = 1.2;       // 道の回り道ぶん（マスをたどった距離に掛ける）
-const BIKE_M_PER_MIN = 250;    // 時速15km
-const BIKE_DETOUR = 1.15;
+// 徒歩・自転車は「マスをたどった距離 × 回り道 ÷ 速さ ＋ 信号待ち」で見積もる。
+// マスをたどった距離は陸の上ではほぼ直線なので、実際の道のり（直線の約1.3倍）に合わせて回り道を掛ける
+// （8方向のマス移動そのものが直線より約5%長いので、掛けるのは1.25）。
+// 信号待ちは道のり1kmあたりの平均。都心の道は1kmに信号が4〜5か所、半分ほどで赤に当たり、平均30〜40秒待つ想定
+const WALK_M_PER_MIN = 80;     // 時速4.8km（不動産表示の分速80m）
+const WALK_DETOUR = 1.25;
+const WALK_SIGNAL_MIN_PER_KM = 1;
+const BIKE_M_PER_MIN = 250;    // 走っている間は時速15km
+const BIKE_DETOUR = 1.25;      // 一方通行・幹線道路沿いを通るぶん
+const BIKE_SIGNAL_MIN_PER_KM = 1;  // 発進・停止のロスも含める。走行中15km/hと合わせて道のりで平均約12km/h
 const WAIT_MIN = 3;            // 最初の電車の待ち時間
 const EGRESS_MAX_MIN = 20;     // 通勤先の近くで電車を降りる駅（徒歩の上限）
 const BRIDGE_CELLS = 2;        // この幅（×2マス＝約400m）までの川・運河は橋で渡れるとみなす
@@ -29,8 +35,8 @@ function meters(lon1, lat1, lon2, lat2) {
   const dy = (lat2 - lat1) * M_PER_DEG_LAT;
   return Math.sqrt(dx * dx + dy * dy);
 }
-const walkMin = (m) => m * WALK_DETOUR / WALK_M_PER_MIN;
-const bikeMin = (m) => m * BIKE_DETOUR / BIKE_M_PER_MIN;
+const walkMin = (m) => m * WALK_DETOUR * (1 / WALK_M_PER_MIN + WALK_SIGNAL_MIN_PER_KM / 1000);
+const bikeMin = (m) => m * BIKE_DETOUR * (1 / BIKE_M_PER_MIN + BIKE_SIGNAL_MIN_PER_KM / 1000);
 
 // ===== マス目 =====
 // 行はメルカトル座標で等間隔にとる（地図の画像レイヤーとずれないように）
@@ -276,7 +282,7 @@ function computeFields() {
   // 電車＋徒歩：通勤先（そのまま歩く）と各駅（待ち＋乗車）から同時に歩いて広げる
   const seeds = [[destCell, 0, -1]];
   state.toDest.forEach((t, s) => { if (t < Infinity && nodeCell[s] >= 0) seeds.push([nodeCell[s], WAIT_MIN + t, s]); });
-  state.trainField = gridDijkstra(seeds, WALK_DETOUR / WALK_M_PER_MIN);
+  state.trainField = gridDijkstra(seeds, walkMin(1));
 }
 
 // ある地点から通勤先までの時間。{min, via: 駅番号 or -1, access: 駅まで歩く分, cell}
