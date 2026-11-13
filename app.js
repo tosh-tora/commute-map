@@ -436,6 +436,11 @@ function showPoint(lon, lat) {
   document.getElementById('point-sub').textContent = ok
     ? `${MODE_LABEL[state.mode]}・直線 ${dKm.toFixed(1)}km`
     : '海の上か、陸から行けない場所です';
+  // 実際の時刻表・道のりで確かめられるよう、同じ出発地・通勤先・手段の Google マップ経路検索へのリンク
+  const gm = new URL('https://www.google.com/maps/dir/');
+  gm.search = new URLSearchParams({ api: '1', origin: `${lat.toFixed(6)},${lon.toFixed(6)}`, destination: `${state.dest.lat},${state.dest.lon}`,
+    travelmode: { train: 'transit', bike: 'bicycling', walk: 'walking' }[state.mode] });
+  document.getElementById('gmap').href = gm.href;
 
   const steps = [];
   const features = [];
